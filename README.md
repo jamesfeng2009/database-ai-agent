@@ -1,19 +1,40 @@
-# 基于 AI 的智能数据库慢查询分析工具
+# Database AI Agent System
 
-这是一个 AI 驱动的智能 SQL 性能分析工具，支持 MySQL、PostgreSQL、TiDB 等多种数据库，专门用于自动化抓取并分析慢查询，然后提供优化建议。
+一个基于多Agent架构的智能数据库管理和分析系统，提供跨数据库查询分析、性能监控、智能优化建议等全方位的数据库管理解决方案。
 
-## 功能特点
+## 🚀 核心功能
 
-- 🗄️ **多数据库支持**: 支持 MySQL、PostgreSQL、TiDB 等多种数据库
-- 🔀 **三种分析模式**: 支持基础分析、本地AI分析和云端AI分析 三种分析模式
-- 📋 **执行计划解读**: 用自然语言解读数据库 EXPLAIN 执行计划
-- 🚨 **自动问题检测**: 从执行计划中自动识别全表扫描、缺失索引、临时表等多种常见性能问题
-- 📊 **性能评分**: 自动计算每条查询的性能评分（0-100 分）
-- 💡 **优化建议**: 提供具体的 SQL 优化建议和示例代码
-- 🔍 **AI 深度分析**: 基于大语言模型提供专业的 SQL 性能分析和优化建议
-- 📦 **批量处理**: 支持批量分析多个慢查询并生成统计结果
-- 📄 **HTML 报告**: 生成美观的可视化 HTML 分析报告
-- 🔧 **数据库抽象层**: 易于扩展支持新的数据库类型
+### 🔍 跨数据库查询分析
+- **智能查询解析**: 自动识别跨数据库查询并分析性能影响
+- **依赖关系可视化**: 生成数据库间依赖关系图谱
+- **性能瓶颈识别**: 精确定位跨库查询的性能瓶颈
+- **优化建议生成**: 基于分析结果提供个性化优化建议
+
+### 🤖 多Agent协作架构
+- **智能任务分配**: 自动将复杂任务分解并分配给专业Agent
+- **协调器管理**: 统一协调多个Agent的工作流程
+- **上下文隔离**: 确保不同Agent间的独立性和数据安全
+- **结果融合**: 智能合并多个Agent的分析结果
+
+### 📊 实时性能监控
+- **跨数据库事务监控**: 实时监控跨库事务的性能指标
+- **智能告警系统**: 基于可配置规则的性能告警
+- **可视化仪表板**: 直观展示数据库性能趋势
+- **历史数据分析**: 提供性能历史趋势分析
+
+### 🎯 智能优化引擎
+- **分布式查询优化**: 针对跨数据库查询的专业优化策略
+- **自动索引建议**: 基于查询模式的智能索引推荐
+- **查询重写**: 提供优化后的SQL重构方案
+- **性能预测**: 预估优化后的性能改进效果
+
+### 🗄️ 多数据库支持
+- **MySQL**: 完整支持包括性能监控和优化建议
+- **PostgreSQL**: 原生支持PostgreSQL特有功能
+- **TiDB**: 分布式数据库优化支持
+- **SQL Server**: 企业级数据库管理
+- **Oracle**: 大型企业数据库支持
+- **SQLite**: 轻量级数据库支持
 
 ## 🛡️ 安全特性
 
@@ -94,8 +115,8 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/sql-analyzer.git
-cd sql-analyzer
+git clone https://github.com/jamesfeng2009/database-ai-agent.git
+cd database-ai-agent
 
 # 运行安装脚本
 python install_dependencies.py
@@ -105,14 +126,14 @@ python install_dependencies.py
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-username/sql-analyzer.git
-cd sql-analyzer
+git clone https://github.com/jamesfeng2009/database-ai-agent.git
+cd database-ai-agent
 
 # 创建虚拟环境（推荐）
-python -m venv sql_analyzer_env
-source sql_analyzer_env/bin/activate  # Linux/Mac
+python -m venv database_ai_agent_env
+source database_ai_agent_env/bin/activate  # Linux/Mac
 # 或
-sql_analyzer_env\Scripts\activate     # Windows
+database_ai_agent_env\Scripts\activate     # Windows
 
 # 安装依赖
 pip install -r requirements.txt
@@ -135,6 +156,26 @@ python install_dependencies.py
 python -c "import pydantic, dotenv, aiomysql, asyncpg, httpx, openai; print('✅ 安装成功')"
 ```
 
+## 🏗️ 技术特色
+
+### 多Agent协作架构
+- **模块化设计**: 每个Agent专注于特定领域的专业分析
+- **异步处理**: 全面采用async/await模式，支持高并发操作
+- **智能调度**: 基于任务复杂度和Agent能力的智能任务分配
+- **容错机制**: 内置故障检测和自动恢复机制
+
+### 跨数据库分析引擎
+- **SQL解析**: 智能识别跨数据库查询中的表引用和依赖关系
+- **性能建模**: 基于网络延迟、数据传输量等因素的性能预测模型
+- **优化策略**: 支持谓词下推、连接重排序、并行执行等多种优化策略
+- **可视化展示**: 生成数据库依赖关系图和性能分析报告
+
+### 实时监控系统
+- **事务追踪**: 实时监控跨数据库事务的执行状态
+- **性能指标**: 收集CPU、内存、网络、锁等多维度性能数据
+- **智能告警**: 基于机器学习的异常检测和预警机制
+- **历史分析**: 提供性能趋势分析和容量规划建议
+
 ## 🗄️ 支持的数据库
 
 ### MySQL
@@ -155,60 +196,49 @@ python -c "import pydantic, dotenv, aiomysql, asyncpg, httpx, openai; print('✅
 - **执行计划**: 兼容 MySQL EXPLAIN
 - **优化建议**: TiDB 特定的分布式优化建议
 
-## 项目结构
+## 📁 项目架构
 
 ```
-sqlAnalyzer/
-├── app.py                    # 主程序入口
-├── install_dependencies.py   # 依赖安装脚本
-├── requirements.txt          # 依赖包列表
-├── pyproject.toml           # 项目配置文件
-├── config/
-│   └── env.example          # 环境变量配置示例
-├── src/
-│   └── sql_analyzer/
-│       ├── __init__.py      # 包初始化
-│       ├── agent.py         # AI 智能体实现
-│       ├── analyzer_base.py # SQL 分析智能体抽象基类
-│       ├── config.py        # 配置管理
-│       ├── models.py        # 数据模型定义
-│       ├── report.py        # HTML 报告生成
-│       ├── slow_query_analyzer.py  # 慢查询分析器
-│       ├── tools.py         # 分析工具函数
-│       └── database/        # 数据库抽象层
-│           ├── __init__.py
-│           ├── connector_base.py  # 数据库连接器抽象基类
-│           ├── adapters.py   # 数据库适配器
-│           ├── factory.py   # 数据库工厂函数
-│           ├── models.py    # 数据库配置模型
-│           ├── mysql.py     # MySQL 实现
-│           └── postgresql.py # PostgreSQL 实现
-├── examples/                # 使用示例
-│   └── add_new_database.py # 添加新数据库支持示例
+database-ai-agent/
+├── src/sql_analyzer/
+│   ├── agent_core/                    # 多Agent核心架构
+│   │   ├── agents/                    # 专业化Agent实现
+│   │   │   ├── base_agent.py         # Agent基类
+│   │   │   ├── coordinator_agent.py  # 协调器Agent
+│   │   │   ├── knowledge_agent.py    # 知识管理Agent
+│   │   │   ├── memory_agent.py       # 记忆管理Agent
+│   │   │   ├── nlp_agent.py          # 自然语言处理Agent
+│   │   │   └── sql_analysis_agent.py # SQL分析Agent
+│   │   ├── communication/            # Agent间通信
+│   │   │   ├── a2a_protocol.py       # Agent-to-Agent协议
+│   │   │   └── event_system.py       # 事件系统
+│   │   ├── management/               # 管理和协调
+│   │   │   ├── agent_orchestrator.py # Agent编排器
+│   │   │   ├── intelligent_workflows.py # 智能工作流
+│   │   │   └── multi_agent_system.py # 多Agent系统
+│   │   └── services/                 # 核心服务
+│   │       ├── auto_optimizer.py     # 自动优化器
+│   │       ├── safety_validator.py   # 安全验证器
+│   │       └── sql_integration.py    # SQL集成服务
+│   ├── database/                     # 数据库抽象层
+│   │   ├── cross_database_analyzer.py # 跨数据库分析器
+│   │   ├── cross_database_monitor.py  # 跨数据库监控器
+│   │   ├── distributed_query_optimizer.py # 分布式查询优化器
+│   │   ├── database_manager.py       # 数据库管理器
+│   │   ├── connection_manager.py     # 连接管理器
+│   │   └── adapters.py              # 数据库适配器
+│   ├── dashboard/                    # 可视化仪表板
+│   │   ├── dashboard_manager.py      # 仪表板管理器
+│   │   ├── cross_database_visualizer.py # 跨数据库可视化
+│   │   └── metrics_collector.py     # 指标收集器
+│   └── nlp/                         # 自然语言处理
+│       ├── processor.py             # NLP处理器
+│       ├── intent_classifier.py     # 意图分类器
+│       └── entity_extractor.py      # 实体提取器
+├── docs/                            # 技术文档
+├── examples/                        # 使用示例
+├── pyproject.toml                   # 项目配置
 └── README.md
-```
-
-### 核心架构
-
-```
-src/sql_analyzer/
-├── analyzer_base.py         # 抽象基类和接口定义
-├── config.py               # 配置管理模块
-├── agent.py                # 智能体实现
-├── models.py               # 数据模型定义
-├── tools.py                # 分析工具函数
-├── report.py               # HTML 报告生成
-├── slow_query_analyzer.py  # 慢查询分析器主模块
-└── database/               # 数据库抽象层
-    ├── connector_base.py   # 数据库连接器抽象基类
-    ├── adapters.py         # 数据库适配器
-    ├── factory.py          # 数据库工厂函数
-    ├── mysql.py            # MySQL 实现
-    └── postgresql.py       # PostgreSQL 实现
-
-app.py   # 主程序入口
-report/  # HTML报告目录
-tests/   # 单元测试目录
 ```
 
 ## 🔄 工具运作流程
@@ -442,10 +472,46 @@ SELECT * FROM performance_schema.setup_consumers WHERE NAME = 'events_statements
 UPDATE performance_schema.setup_consumers SET ENABLED = 'YES' WHERE NAME = 'events_statements_history_long';
 ```
 
-### 4. 运行主程序
+### 4. 快速开始
 
+#### 基础SQL分析
 ```bash
+# 运行传统的慢查询分析
 python app.py
+```
+
+#### 跨数据库查询分析
+```python
+from src.sql_analyzer.database.database_manager import DatabaseManager
+from src.sql_analyzer.database.cross_database_analyzer import CrossDatabaseAnalyzer
+
+# 初始化数据库管理器
+db_manager = DatabaseManager()
+cross_db_analyzer = CrossDatabaseAnalyzer(db_manager)
+
+# 分析跨数据库查询
+sql = """
+SELECT u.name, o.total_amount, p.product_name
+FROM ecommerce_db.users u
+JOIN analytics_db.orders o ON u.id = o.user_id
+JOIN inventory_db.products p ON o.product_id = p.id
+WHERE o.order_date >= '2024-01-01'
+"""
+
+# 执行分析
+query_analysis = await cross_db_analyzer.analyze_cross_database_query(sql)
+performance_impact = await cross_db_analyzer.analyze_performance_impact(query_analysis)
+
+print(f"查询类型: {query_analysis.query_type}")
+print(f"涉及数据库: {len(query_analysis.involved_databases)}")
+print(f"估算成本: {query_analysis.estimated_cost}")
+print(f"优化建议: {query_analysis.optimization_suggestions}")
+```
+
+#### 启动监控仪表板
+```python
+# 运行跨数据库监控演示
+python demo_cross_database_analysis.py
 ```
 
 ### MySQL 慢查询数据源
@@ -519,13 +585,38 @@ A: 请检查：
 - 网络连接是否正常
 - API 密钥是否有足够的额度
 
-**Q: 如果没有 API 密钥，工具还能正常使用吗？**
-A: 完全可以！基础分析模式提供了快速 SQL 性能分析功能：
+**Q: 如何使用跨数据库分析功能？**
+A: 跨数据库分析是本系统的核心功能：
 
-- ✅ EXPLAIN 执行计划分析
-- ✅ 常见性能问题检测（全表扫描、缺失索引等）
-- ✅ 性能评分计算
-- ✅ 结构化的基础优化建议
-- ✅ HTML 可视化报告
+- ✅ 自动识别跨数据库查询
+- ✅ 分析数据库间依赖关系
+- ✅ 生成性能影响评估报告
+- ✅ 提供分布式查询优化建议
+- ✅ 实时监控跨数据库事务
+
+**Q: 多Agent系统如何工作？**
+A: 系统采用专业化Agent协作模式：
+
+- 🤖 **协调器Agent**: 负责任务分解和结果整合
+- 🧠 **知识管理Agent**: 管理数据库优化知识库
+- 💾 **记忆管理Agent**: 处理历史分析数据和用户偏好
+- 🔍 **SQL分析Agent**: 专门负责SQL性能分析
+- 📊 **监控Agent**: 实时收集和分析性能指标
+
+## 📚 相关文档
+
+- [跨数据库分析实现详解](CROSS_DATABASE_ANALYSIS_IMPLEMENTATION.md)
+- [多Agent协作架构](MULTI_AGENT_COLLABORATION_SUMMARY.md)
+- [智能工作流系统](INTELLIGENT_WORKFLOWS_SUMMARY.md)
+- [仪表板实现指南](DASHBOARD_IMPLEMENTATION_SUMMARY.md)
+- [高级记忆架构](MEMORY_ARCHITECTURE_SUMMARY.md)
+
+## 🤝 贡献指南
+
+欢迎提交Issue和Pull Request来帮助改进项目！
+
+## 📄 许可证
+
+本项目采用 MIT 许可证 - 查看 [LICENSE](LICENSE) 文件了解详情。
 
 
