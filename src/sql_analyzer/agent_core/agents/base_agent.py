@@ -5,7 +5,9 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import logging
 
+from ..communication.a2a_protocol import (
     A2AMessage, AgentInfo, MessageBus, MessageHandler, MessageType,
     get_message_bus, send_a2a_request, send_a2a_notification
 )
