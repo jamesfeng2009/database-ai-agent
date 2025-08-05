@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sql-analyzer"
+version = "0.1.0"
+description = "智能数据库慢查询性能分析工具 - 支持 MySQL、PostgreSQL、TiDB"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "SQL Analyzer Team", email = "support@sql-analyzer.com"}
+]
+keywords = ["sql", "database", "performance", "analysis", "mysql", "postgresql", "tidb", "ai", "optimization"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Database Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    "autogen-agentchat>=0.4.0",
+    "autogen-ext[openai]>=0.4.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.0.0",
+    "aiomysql>=0.2.0",
+    "pymysql>=1.1.0",
+    "asyncpg>=0.29.0",
+    "httpx>=0.25.0",
+    "openai>=1.0.0",
+    "sqlparse>=0.4.0",
+    "spacy>=3.7.0",
+    "transformers>=4.30.0",
+    "torch>=2.0.0",
+    "scikit-learn>=1.3.0",
+    "jieba>=0.42.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-username/sql-analyzer"
+Documentation = "https://github.com/your-username/sql-analyzer/blob/main/README.md"
+Repository = "https://github.com/your-username/sql-analyzer.git"
+Issues = "https://github.com/your-username/sql-analyzer/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-mock>=3.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "RUF"]
+ignore = []
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"] 
