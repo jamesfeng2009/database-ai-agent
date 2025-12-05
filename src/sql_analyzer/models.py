@@ -127,6 +127,10 @@ class SlowQueryAnalysisResult(BaseModel):
     slow_query: SlowQueryEntry = Field(..., description="慢查询信息")
     analysis_response: SQLAnalysisResponse = Field(..., description="分析结果")
     explain_results: List[ExplainResult] = Field(..., description="EXPLAIN 结果")
+    optimize_result: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="自动优化结果, 包含 best_sql / best_reason / improvement 等信息"
+    )
 
 
 class BatchAnalysisResult(BaseModel):

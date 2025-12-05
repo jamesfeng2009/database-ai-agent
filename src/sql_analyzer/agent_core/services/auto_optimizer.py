@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from ...database.connector_base import BaseDatabaseConnector
 from ...database.adapters import DatabaseAdapter, DatabaseAdapterFactory
+from ...tools import _detect_database_type
 from .safety_validator import SafetyValidator, User, ValidationResult, RiskLevel
 from ..models.models import Task, TaskStatus, TaskPriority
 
@@ -57,6 +58,7 @@ class QueryRewriteSuggestion(BaseModel):
     expected_improvement: str = Field(..., description="预期改进")
     confidence: float = Field(..., description="建议置信度")
     explanation: str = Field(..., description="重写说明")
+    rule_name: Optional[str] = Field(None, description="触发该建议的重写规则名称")
 
 
 class ConfigParameter(BaseModel):
@@ -105,6 +107,8 @@ class AutoOptimizer:
         self.safety_validator = safety_validator
         self.optimization_history: List[OptimizationResult] = []
         self.active_optimizations: Dict[str, OptimizationResult] = {}
+        # schema 信息缓存: (db_type, table_name) -> [columns]
+        self._schema_cache: Dict[Tuple[str, str], List[str]] = {}
         
         # 初始化优化规则
         self._init_optimization_rules()
@@ -139,12 +143,24 @@ class AutoOptimizer:
             },
             "exists_to_join": {
                 "pattern": r"WHERE\s+EXISTS\s*\(",
-                "description": "将EXISTS转换为JOIN"
+                "description": "将EXISTS转换为JOIN(提示型)"
             },
             "union_to_union_all": {
                 "pattern": r"UNION(?!\s+ALL)",
-                "description": "将UNION转换为UNION ALL（如果适用）"
-            }
+                "description": "在结果无需去重时, 可考虑将UNION改为UNION ALL(提示型)"
+            },
+            "select_star_to_columns": {
+                "pattern": r"SELECT\s+\*\s+FROM",
+                "description": "将SELECT * 基于schema改写为具体列名(仅MySQL)"
+            },
+            "or_to_in_list": {
+                "pattern": r"WHERE\s+.+\s*=\s*.+\s+OR\s+",
+                "description": "将同一列的多个OR等值条件合并为IN列表(简化版)"
+            },
+            "implicit_join_to_explicit": {
+                "pattern": r"FROM\s+[a-zA-Z_][a-zA-Z0-9_]*\s*,\s*[a-zA-Z_][a-zA-Z0-9_]*",
+                "description": "将FROM t1, t2隐式连接改写为显式JOIN(提示型)"
+            },
         }
         
         # 配置参数优化规则
@@ -701,7 +717,195 @@ class AutoOptimizer:
     def get_active_optimizations(self) -> Dict[str, OptimizationResult]:
         """获取当前活跃的优化操作."""
         return self.active_optimizations.copy()
-    
+
+    async def optimize_query(
+        self,
+        sql: str,
+        connector: BaseDatabaseConnector,
+        user: User,
+        auto_apply: bool = False,
+    ) -> Dict[str, Any]:
+        """对单条查询执行自动优化流程.
+
+        当前实现只生成重写候选并基于 EXPLAIN 评估成本, 不直接在数据库中
+        执行任何结构性变更或自动替换原始 SQL。
+        """
+
+        logger.info("开始自动优化查询")
+
+        # 1. 生成重写候选
+        rewrite_suggestions = await self.suggest_query_rewrite(sql, connector)
+        candidate_sqls: List[str] = []
+        for s in rewrite_suggestions:
+            if s.rewritten_query and s.rewritten_query.strip() and s.rewritten_query.strip() != sql.strip():
+                candidate_sqls.append(s.rewritten_query)
+
+        # 确保至少评估原始 SQL
+        all_sqls = [sql] + [c for c in candidate_sqls if c.strip()]
+
+        # 2. 评估所有候选
+        eval_results = await self.evaluate_query_candidates(connector, sql, all_sqls)
+        if not eval_results:
+            return {
+                "original_sql": sql,
+                "best_sql": sql,
+                "improvement": 0.0,
+                "candidates": [],
+                "rewrite_suggestions": [s.dict() for s in rewrite_suggestions],
+                "auto_applied": False,
+            }
+
+        # 找到原始 SQL 和最佳候选
+        orig_entry = next((e for e in eval_results if e["sql"] == sql), None)
+        best_entry = min(eval_results, key=lambda e: e["cost"])
+
+        orig_cost = orig_entry["cost"] if orig_entry else best_entry["cost"]
+        best_cost = best_entry["cost"]
+        improvement = max(0.0, orig_cost - best_cost)
+
+        # 尝试找到与最佳 SQL 对应的重写建议, 以便向上层解释原因
+        best_suggestion = None
+        for s in rewrite_suggestions:
+            try:
+                if s.rewritten_query and s.rewritten_query.strip() == best_entry["sql"].strip():
+                    best_suggestion = s
+                    break
+            except Exception:
+                continue
+
+        best_reason = None
+        if best_suggestion is not None:
+            best_reason = {
+                "rule_name": best_suggestion.rule_name,
+                "explanation": best_suggestion.explanation,
+                "improvement_type": best_suggestion.improvement_type,
+            }
+
+        # 根据 auto_apply 开关和安全验证结果决定是否认为可以“自动使用” best_sql
+        auto_applied = False
+        if auto_apply and best_entry["sql"].strip() != sql.strip():
+            try:
+                validation = await self.safety_validator.validate_sql_operation(
+                    best_entry["sql"], user, connector.config.database
+                )
+                auto_applied = bool(validation.is_valid)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("auto_apply 验证失败: %s", e)
+                auto_applied = False
+
+        return {
+            "original_sql": sql,
+            "best_sql": best_entry["sql"],
+            "best_cost": best_cost,
+            "original_cost": orig_cost,
+            "improvement": improvement,
+            "best_reason": best_reason,
+            "candidates": eval_results,
+            "rewrite_suggestions": [s.dict() for s in rewrite_suggestions],
+            "auto_applied": auto_applied,
+        }
+
+    async def evaluate_query_candidates(
+        self,
+        connector: BaseDatabaseConnector,
+        original_sql: str,
+        candidate_sqls: List[str],
+    ) -> List[Dict[str, Any]]:
+        """对给定的一组 SQL 候选进行 EXPLAIN 评估并打分.
+
+        返回列表中每个元素包含: sql / role / cost / explain_results。
+        cost 只是相对指标, 仅用于在同一批候选中比较优劣。
+        """
+
+        results: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+
+        for sql in candidate_sqls:
+            normalized = sql.strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+
+            try:
+                explain_results = await connector.execute_explain(sql)
+                cost = self._estimate_query_cost(explain_results)
+                results.append(
+                    {
+                        "sql": sql,
+                        "role": "original" if sql == original_sql else "candidate",
+                        "cost": cost,
+                        "explain_results": [r.dict() for r in explain_results],
+                    }
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("评估候选 SQL 失败: %s", e)
+                continue
+
+        # 按成本从低到高排序, 成本越低认为越优
+        results.sort(key=lambda x: x["cost"])
+        return results
+
+    def _estimate_query_cost(self, explain_results: List[Any]) -> float:
+        """基于 EXPLAIN 结果估算查询成本 (简化版).
+
+        成本主要由预估扫描行数、是否存在全表扫描、是否使用临时表/文件排序等决定。
+        返回的成本值仅在同一批候选间比较有意义。
+        """
+
+        if not explain_results:
+            return float("inf")
+
+        try:
+            db_type = _detect_database_type(explain_results)
+            adapter: DatabaseAdapter = DatabaseAdapterFactory.create_adapter(db_type)
+        except Exception:
+            # 如果适配器创建失败, 退化为简单统计 rows
+            total_rows = 0
+            for r in explain_results:
+                rows = getattr(r, "rows", None)
+                if isinstance(rows, int):
+                    total_rows += rows
+            return float(total_rows or 1)
+
+        total_rows = 0
+        has_full_scan = False
+        has_temp = False
+        has_filesort = False
+
+        for r in explain_results:
+            try:
+                rows = adapter.get_scan_rows(r)
+            except Exception:
+                rows = getattr(r, "rows", 0) or 0
+            total_rows += rows
+
+            try:
+                if adapter.is_full_table_scan(r):
+                    has_full_scan = True
+            except Exception:
+                pass
+
+            try:
+                extra = adapter.get_extra_info(r) or ""
+            except Exception:
+                extra = getattr(r, "extra", "") or ""
+
+            if "Using temporary" in str(extra):
+                has_temp = True
+            if "Using filesort" in str(extra):
+                has_filesort = True
+
+        # 基础成本 = 总扫描行数, 加上一些惩罚项
+        cost = float(max(total_rows, 1))
+        if has_full_scan:
+            cost *= 5.0
+        if has_temp:
+            cost *= 1.5
+        if has_filesort:
+            cost *= 1.5
+
+        return cost
+
     # 私有辅助方法
     
     def _generate_create_index_sql(self, index_spec: IndexSpec, database_type: str) -> str:
@@ -842,35 +1046,252 @@ class AutoOptimizer:
             "query_plan_improvements": "expected",
             "update_duration": "varies_by_table_size"
         }
-    
-    async def _analyze_query_structure(self, sql: str, connector: BaseDatabaseConnector) -> Dict[str, Any]:
-        """分析查询结构."""
-        return {
+
+    async def _get_mysql_table_columns(
+        self,
+        connector: BaseDatabaseConnector,
+        table_name: str,
+    ) -> List[str]:
+        """获取 MySQL 表的列名列表, 使用简单缓存."""
+
+        db_type = getattr(connector, "database_type", "").lower()
+        if db_type != "mysql":
+            return []
+
+        cache_key = (db_type, table_name)
+        if cache_key in self._schema_cache:
+            return self._schema_cache[cache_key]
+
+        sql = (
+            "SELECT COLUMN_NAME FROM information_schema.columns "
+            "WHERE table_schema = DATABASE() "
+            f"AND table_name = '{table_name}' "
+            "ORDER BY ORDINAL_POSITION"
+        )
+        try:
+            rows = await connector.execute_query(sql)
+            cols = [row["COLUMN_NAME"] for row in rows if "COLUMN_NAME" in row]
+            self._schema_cache[cache_key] = cols
+            return cols
+        except Exception as e:  # noqa: BLE001
+            logger.warning("获取表列信息失败: %s", e)
+            return []
+
+    async def _analyze_query_structure(
+        self,
+        sql: str,
+        connector: BaseDatabaseConnector,
+    ) -> Dict[str, Any]:
+        """分析查询结构, 并尝试基于schema解析 SELECT * (当前仅 MySQL)."""
+
+        import re
+
+        analysis: Dict[str, Any] = {
             "has_subquery": "IN (" in sql.upper(),
             "has_exists": "EXISTS" in sql.upper(),
             "has_union": "UNION" in sql.upper(),
-            "has_join": "JOIN" in sql.upper()
+            "has_join": "JOIN" in sql.upper(),
         }
-    
-    async def _apply_rewrite_rule(self, sql: str, rule_name: str, rule_config: Dict[str, Any], query_analysis: Dict[str, Any]) -> Optional[QueryRewriteSuggestion]:
+
+        select_star_columns: Dict[str, List[str]] = {}
+        try:
+            db_type = getattr(connector, "database_type", "").lower()
+            if db_type == "mysql":
+                # 简单匹配: SELECT * FROM table_name ...
+                m = re.search(
+                    r"select\s*\*\s*from\s+([a-zA-Z_][a-zA-Z0-9_]*)",
+                    sql,
+                    re.IGNORECASE,
+                )
+                if m:
+                    table_name = m.group(1)
+                    cols = await self._get_mysql_table_columns(connector, table_name)
+                    if cols:
+                        select_star_columns[table_name] = cols
+        except Exception as e:  # noqa: BLE001
+            logger.warning("解析 SELECT * schema 信息失败: %s", e)
+
+        if select_star_columns:
+            analysis["select_star_columns"] = select_star_columns
+
+        return analysis
+
+    async def _apply_rewrite_rule(
+        self,
+        sql: str,
+        rule_name: str,
+        rule_config: Dict[str, Any],
+        query_analysis: Dict[str, Any],
+    ) -> Optional[QueryRewriteSuggestion]:
         """应用查询重写规则."""
         import re
-        
+
         pattern = rule_config.get("pattern", "")
         if not pattern or not re.search(pattern, sql, re.IGNORECASE):
             return None
-        
-        # 简化的重写逻辑，实际应该更复杂
+
+        # 1) 子查询 IN (...) → EXISTS(...) (示例性, 可参与候选)
         if rule_name == "subquery_to_join" and query_analysis.get("has_subquery"):
             return QueryRewriteSuggestion(
                 original_query=sql,
-                rewritten_query=sql.replace("IN (SELECT", "EXISTS (SELECT"),  # 简化示例
+                rewritten_query=sql.replace("IN (SELECT", "EXISTS (SELECT"),
                 improvement_type="subquery_optimization",
-                expected_improvement="可能提升查询性能",
+                expected_improvement="将IN子查询改为EXISTS可能提升性能(需人工确认语义等价)",
                 confidence=0.7,
-                explanation="将IN子查询转换为EXISTS可能提升性能"
+                explanation="检测到 IN 子查询, 已示例性改写为 EXISTS, 请确认语义等价后再采用。",
+                rule_name=rule_name,
             )
-        
+
+        # 2) EXISTS 提示 + 示例 JOIN 重写 (不参与候选)
+        if rule_name == "exists_to_join" and query_analysis.get("has_exists"):
+            example = (
+                "示例:\n"
+                "原始:\n"
+                "  SELECT ... FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.x = t1.x AND 条件)\n"
+                "可以考虑改写为:\n"
+                "  SELECT DISTINCT t1.* FROM t1 JOIN t2 ON t2.x = t1.x AND 条件\n"
+            )
+            return QueryRewriteSuggestion(
+                original_query=sql,
+                rewritten_query=sql,
+                improvement_type="exists_join_hint",
+                expected_improvement="在部分场景下将 EXISTS 改写为 JOIN 可获得更好的执行计划",
+                confidence=0.5,
+                explanation=(
+                    "检测到 EXISTS 子查询, 建议在确认语义等价的前提下改写为 JOIN 以提升可读性和潜在性能。\n"
+                    + example
+                ),
+                rule_name=rule_name,
+            )
+
+        # 3) UNION → UNION ALL 提示 (不参与候选)
+        if rule_name == "union_to_union_all" and query_analysis.get("has_union"):
+            return QueryRewriteSuggestion(
+                original_query=sql,
+                rewritten_query=sql,
+                improvement_type="union_all_hint",
+                expected_improvement="在结果无需去重时, 使用 UNION ALL 可避免不必要的去重开销",
+                confidence=0.5,
+                explanation="检测到 UNION, 如结果不需要去重, 建议手动改为 UNION ALL 以降低排序/去重成本。",
+                rule_name=rule_name,
+            )
+
+        # 4) schema 感知的 SELECT * → 显式列名 (MySQL), 否则仅提示
+        if rule_name == "select_star_to_columns":
+            cols_map = query_analysis.get("select_star_columns") or {}
+            rewritten_sql = sql
+
+            if cols_map:
+                # 只处理第一个匹配的表
+                table_name, columns = next(iter(cols_map.items()))
+                if columns:
+                    column_list = ", ".join(columns)
+                    try:
+                        rewritten_sql = re.sub(
+                            r"SELECT\s*\*\s*FROM",
+                            f"SELECT {column_list} FROM",
+                            sql,
+                            count=1,
+                            flags=re.IGNORECASE,
+                        )
+                    except re.error:  # noqa: BLE001
+                        rewritten_sql = sql
+
+                    return QueryRewriteSuggestion(
+                        original_query=sql,
+                        rewritten_query=rewritten_sql,
+                        improvement_type="select_star_rewrite",
+                        expected_improvement="显式列出字段可减少不必要的数据扫描和传输",
+                        confidence=0.8,
+                        explanation=(
+                            f"检测到 SELECT *, 已基于 information_schema 将表 {table_name} 的所有字段替换为显式字段列表, "
+                            "请确认列集是否符合业务需求后采用。"
+                        ),
+                        rule_name=rule_name,
+                    )
+
+            # 没有 schema 信息时, 退回提示型建议
+            return QueryRewriteSuggestion(
+                original_query=sql,
+                rewritten_query=sql,
+                improvement_type="select_star_warning",
+                expected_improvement="显式列出需要的字段可减少不必要的数据传输和扫描",
+                confidence=0.6,
+                explanation="检测到 SELECT *, 建议将 * 替换为实际需要的字段列表, 以便优化索引使用和减少传输量。",
+                rule_name=rule_name,
+            )
+
+        # 5) 单表多 OR 条件 → IN 列表 (简化版, 作为候选)
+        if rule_name == "or_to_in_list":
+            where_match = re.search(r"(WHERE\s+)(.+)", sql, re.IGNORECASE | re.DOTALL)
+            if not where_match:
+                return None
+
+            where_clause = where_match.group(2)
+            pattern_eq = re.compile(
+                r"([a-zA-Z_][a-zA-Z0-9_\.]*)\s*=\s*([^\s\)]+)",
+                re.IGNORECASE,
+            )
+            matches = pattern_eq.findall(where_clause)
+            if not matches:
+                return None
+
+            col_values: Dict[str, List[str]] = {}
+            for col, val in matches:
+                col_values.setdefault(col, []).append(val)
+
+            target_col = None
+            values: List[str] = []
+            for col, vs in col_values.items():
+                if len(vs) >= 3:
+                    target_col = col
+                    values = vs
+                    break
+
+            if not target_col:
+                return None
+
+            in_list = f"{target_col} IN ({', '.join(values)})"
+
+            or_pattern = re.compile(
+                rf"{re.escape(target_col)}\s*=\s*[^\s\)]+(\s+OR\s+{re.escape(target_col)}\s*=\s*[^\s\)]+)+",
+                re.IGNORECASE,
+            )
+            new_where_clause, count = or_pattern.subn(in_list, where_clause, count=1)
+            if count == 0:
+                return None
+
+            rewritten_sql = sql[: where_match.start(2)] + new_where_clause
+
+            return QueryRewriteSuggestion(
+                original_query=sql,
+                rewritten_query=rewritten_sql,
+                improvement_type="or_to_in_list",
+                expected_improvement="将多次 OR 等值比较转换为 IN 列表, 可使优化器更容易利用索引",
+                confidence=0.6,
+                explanation="检测到同一列上的多 OR 等值条件, 已尝试重写为 IN 列表, 请确认语义等价后采用。",
+                rule_name=rule_name,
+            )
+
+        # 6) FROM t1, t2 → 显式 JOIN (提示型)
+        if rule_name == "implicit_join_to_explicit":
+            example = (
+                "示例:\n"
+                "原始:\n"
+                "  SELECT ... FROM t1, t2 WHERE t1.id = t2.id AND ...\n"
+                "可以考虑改写为:\n"
+                "  SELECT ... FROM t1 JOIN t2 ON t1.id = t2.id WHERE ...\n"
+            )
+            return QueryRewriteSuggestion(
+                original_query=sql,
+                rewritten_query=sql,
+                improvement_type="implicit_join_hint",
+                expected_improvement="显式 JOIN 语法更清晰, 也更容易让优化器选择合适的计划",
+                confidence=0.5,
+                explanation="检测到 FROM t1, t2 形式的隐式连接, 建议改写为显式 JOIN 语法。\n" + example,
+                rule_name=rule_name,
+            )
+
         return None
     
     async def _generate_execution_plan_based_suggestions(self, sql: str, connector: BaseDatabaseConnector) -> List[QueryRewriteSuggestion]:
@@ -890,7 +1311,8 @@ class AutoOptimizer:
                         improvement_type="full_table_scan_optimization",
                         expected_improvement="避免全表扫描",
                         confidence=0.8,
-                        explanation="检测到全表扫描，建议添加索引或优化WHERE条件"
+                        explanation="检测到全表扫描，建议添加索引或优化WHERE条件",
+                        rule_name="execution_plan_full_table_scan",
                     ))
         
         except Exception as e:
