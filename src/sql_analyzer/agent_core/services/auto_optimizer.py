@@ -9,10 +9,16 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+try:  # 可选依赖, 用于获取系统资源信息, 不存在时自动降级
+    import psutil  # type: ignore
+except Exception:  # noqa: BLE001
+    psutil = None
+
 from ...database.connector_base import BaseDatabaseConnector
 from ...database.adapters import DatabaseAdapter, DatabaseAdapterFactory
 from ...tools import _detect_database_type
 from .safety_validator import SafetyValidator, User, ValidationResult, RiskLevel
+from .knowledge_service import KnowledgeService
 from ..models.models import Task, TaskStatus, TaskPriority
 
 logger = logging.getLogger(__name__)
@@ -102,9 +108,11 @@ class BatchOptimizationPlan(BaseModel):
 class AutoOptimizer:
     """自动优化器 - 提供数据库自动化优化功能."""
     
-    def __init__(self, safety_validator: SafetyValidator):
+    def __init__(self, safety_validator: SafetyValidator, knowledge_service: KnowledgeService | None = None):
         """初始化自动优化器."""
         self.safety_validator = safety_validator
+        # 可选的知识服务, 用于将历史案例/规范附加到优化建议中
+        self.knowledge_service: KnowledgeService | None = knowledge_service
         self.optimization_history: List[OptimizationResult] = []
         self.active_optimizations: Dict[str, OptimizationResult] = {}
         # schema 信息缓存: (db_type, table_name) -> [columns]
@@ -254,6 +262,28 @@ class AutoOptimizer:
                 connector, index_spec
             )
             result.performance_impact = performance_impact
+
+            # 6.1 可选: 基于索引信息关联知识库
+            if self.knowledge_service is not None:
+                try:
+                    ctx = {
+                        "issue": "index_creation",
+                        "table": index_spec.table_name,
+                        "columns": ",".join(index_spec.columns),
+                    }
+                    desc = f"index on {index_spec.table_name}({','.join(index_spec.columns)})"
+                    entries = await self.knowledge_service.related_to_sql(desc, ctx, limit=5)
+                    if entries:
+                        result.performance_impact["related_knowledge"] = [
+                            {
+                                "entry_id": e.entry_id,
+                                "title": e.title,
+                                "source": e.source,
+                            }
+                            for e in entries
+                        ]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("关联索引相关知识失败: %s", e)
             
             result.status = OptimizationStatus.COMPLETED
             result.completed_at = datetime.now()
@@ -415,6 +445,27 @@ class AutoOptimizer:
                 connector, tables
             )
             result.performance_impact = performance_impact
+
+            # 4.1 可选: 关联统计信息相关知识
+            if self.knowledge_service is not None:
+                try:
+                    ctx = {
+                        "issue": "statistics_update",
+                        "tables": ",".join(tables),
+                    }
+                    desc = f"statistics update on tables {','.join(tables)}"
+                    entries = await self.knowledge_service.related_to_sql(desc, ctx, limit=5)
+                    if entries:
+                        result.performance_impact["related_knowledge"] = [
+                            {
+                                "entry_id": e.entry_id,
+                                "title": e.title,
+                                "source": e.source,
+                            }
+                            for e in entries
+                        ]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("关联统计信息相关知识失败: %s", e)
             
             result.status = OptimizationStatus.COMPLETED
             result.completed_at = datetime.now()
@@ -556,6 +607,27 @@ class AutoOptimizer:
                 "config_changes": len(config_recommendations),
                 "requires_restart": any(rec.requires_restart for rec in config_recommendations)
             }
+
+            # 8. 可选: 为配置调优结果关联知识库
+            if self.knowledge_service is not None:
+                try:
+                    ctx = {
+                        "issue": "config_tuning",
+                        "db_type": connector.database_type,
+                    }
+                    desc = "database configuration tuning"
+                    entries = await self.knowledge_service.related_to_sql(desc, ctx, limit=5)
+                    if entries:
+                        result.performance_impact["related_knowledge"] = [
+                            {
+                                "entry_id": e.entry_id,
+                                "title": e.title,
+                                "source": e.source,
+                            }
+                            for e in entries
+                        ]
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("关联配置调优相关知识失败: %s", e)
             
             logger.info(f"数据库配置优化成功，优化ID: {optimization_id}")
             
@@ -746,6 +818,32 @@ class AutoOptimizer:
         # 2. 评估所有候选
         eval_results = await self.evaluate_query_candidates(connector, sql, all_sqls)
         if not eval_results:
+            # 没有可用评估结果时，构造一个保守的 planned_actions，仅包含配置调优和可选的统计更新
+            import re  # 局部导入，避免破坏现有模块结构
+
+            base_sql = sql
+            table_name = None
+            m = re.search(r"from\s+([a-zA-Z_][a-zA-Z0-9_]*)", base_sql, re.IGNORECASE)
+            if m:
+                table_name = m.group(1)
+
+            planned_actions: list[dict[str, Any]] = []
+            if table_name:
+                planned_actions.append(
+                    {
+                        "id": f"stats-{table_name}",
+                        "type": "statistics_update",
+                        "tables": [table_name],
+                    }
+                )
+
+            planned_actions.append(
+                {
+                    "id": "config-tuning",
+                    "type": "config_tuning",
+                }
+            )
+
             return {
                 "original_sql": sql,
                 "best_sql": sql,
@@ -753,6 +851,7 @@ class AutoOptimizer:
                 "candidates": [],
                 "rewrite_suggestions": [s.dict() for s in rewrite_suggestions],
                 "auto_applied": False,
+                "planned_actions": planned_actions,
             }
 
         # 找到原始 SQL 和最佳候选
@@ -793,6 +892,73 @@ class AutoOptimizer:
                 logger.warning("auto_apply 验证失败: %s", e)
                 auto_applied = False
 
+        # 基于 best_sql 构造一组保守的 planned_actions，供后续任务执行阶段消费
+        import re  # 局部导入，避免影响模块其它部分
+
+        base_sql = best_entry["sql"] or sql
+        table_name = None
+        where_column = None
+
+        try:
+            m = re.search(r"from\s+([a-zA-Z_][a-zA-Z0-9_]*)", base_sql, re.IGNORECASE)
+            if m:
+                table_name = m.group(1)
+
+            mw = re.search(r"where\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*=", base_sql, re.IGNORECASE)
+            if mw:
+                where_column = mw.group(1)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("解析 planned_actions 所需的表/列信息失败: %s", e)
+
+        planned_actions: list[dict[str, Any]] = []
+
+        # 1) 如果 best_sql 与原始 sql 不同，给出一个 execute_sql 动作
+        if best_entry["sql"].strip() != sql.strip():
+            planned_actions.append(
+                {
+                    "id": "rewrite-best-sql",
+                    "type": "execute_sql",
+                    "sqls": [best_entry["sql"]],
+                }
+            )
+
+        # 2) 如果能解析出表名，给出 statistics_update 动作
+        if table_name:
+            planned_actions.append(
+                {
+                    "id": f"stats-{table_name}",
+                    "type": "statistics_update",
+                    "tables": [table_name],
+                }
+            )
+
+        # 3) 如果能解析出 where 列，则为该列构造一个单列索引创建动作
+        if table_name and where_column:
+            planned_actions.append(
+                {
+                    "id": f"idx-{table_name}-{where_column}",
+                    "type": "index_creation",
+                    "spec": {
+                        "table_name": table_name,
+                        "columns": [where_column],
+                        "index_name": f"idx_{table_name}_{where_column}",
+                        "index_type": "BTREE",
+                        "is_unique": False,
+                        "is_partial": False,
+                        "where_clause": None,
+                        "storage_parameters": {},
+                    },
+                }
+            )
+
+        # 4) 始终附加一个配置调优动作
+        planned_actions.append(
+            {
+                "id": "config-tuning",
+                "type": "config_tuning",
+            }
+        )
+
         return {
             "original_sql": sql,
             "best_sql": best_entry["sql"],
@@ -803,6 +969,7 @@ class AutoOptimizer:
             "candidates": eval_results,
             "rewrite_suggestions": [s.dict() for s in rewrite_suggestions],
             "auto_applied": auto_applied,
+            "planned_actions": planned_actions,
         }
 
     async def evaluate_query_candidates(
@@ -1001,7 +1168,11 @@ class AutoOptimizer:
             return False
     
     async def _get_index_info(self, connector: BaseDatabaseConnector, index_name: str, table_name: str) -> Optional[Dict[str, Any]]:
-        """获取索引信息."""
+        """获取索引信息.
+
+        对 MySQL 返回 information_schema.statistics 行列表(同一索引的多列),
+        对 PostgreSQL 返回 pg_indexes 的单行记录。
+        """
         if connector.database_type.lower() == "mysql":
             sql = f"""
             SELECT * FROM information_schema.statistics 
@@ -1021,30 +1192,204 @@ class AutoOptimizer:
         
         try:
             result = await connector.execute_query(sql)
+            if connector.database_type.lower() == "mysql":
+                # MySQL: 返回多行(每行一列), 交给后续逻辑分组
+                return result or None
+            # PostgreSQL: 只需一行 indexdef
             return result[0] if result else None
         except Exception:
             return None
     
     def _generate_recreate_index_sql(self, index_info: Dict[str, Any], database_type: str) -> str:
         """根据索引信息生成重新创建索引的SQL."""
-        # 这里需要根据具体的索引信息格式来实现
-        # 简化实现，实际应该解析索引信息
-        return f"-- 重新创建索引的SQL需要根据具体索引信息实现"
+        if not index_info:
+            return "-- 无法根据空索引信息生成重建SQL"
+
+        db_type = database_type.lower()
+
+        # MySQL: index_info 为 information_schema.statistics 的多行
+        if db_type == "mysql":
+            rows: List[Dict[str, Any]]
+            if isinstance(index_info, list):  # type: ignore[assignment]
+                rows = index_info  # type: ignore[assignment]
+            else:
+                rows = [index_info]
+
+            if not rows:
+                return "-- 无索引行信息, 无法生成重建SQL"
+
+            # 按约定: 所有行属于同一个 (table_name, index_name)
+            first = rows[0]
+            table_name = first.get("table_name") or first.get("TABLE_NAME")
+            index_name = first.get("index_name") or first.get("INDEX_NAME")
+            non_unique = first.get("non_unique") if "non_unique" in first else first.get("NON_UNIQUE")
+            index_type = first.get("index_type") or first.get("INDEX_TYPE") or "BTREE"
+
+            if not table_name or not index_name:
+                return "-- 索引信息缺少表名或索引名, 无法生成重建SQL"
+
+            if str(index_name).upper() == "PRIMARY":
+                return "-- PRIMARY KEY 由表结构维护, 不在这里重建"
+
+            columns: List[str] = []
+            for r in rows:
+                col = r.get("column_name") or r.get("COLUMN_NAME")
+                if col:
+                    columns.append(str(col))
+
+            if not columns:
+                return f"-- 未找到索引 {index_name} 的列信息, 无法生成重建SQL"
+
+            is_unique = str(non_unique or "1") == "0"
+            index_type = str(index_type or "BTREE").upper()
+            col_list = ", ".join(f"`{c}`" for c in columns)
+
+            sql = "CREATE"
+            if is_unique:
+                sql += " UNIQUE"
+            sql += f" INDEX `{index_name}` ON `{table_name}` ({col_list})"
+            if index_type and index_type != "BTREE":
+                sql += f" USING {index_type}"
+
+            return sql
+
+        # PostgreSQL: index_info 为 pg_indexes 的单行, 直接使用 indexdef
+        if db_type == "postgresql":
+            if isinstance(index_info, list) and index_info:
+                row = index_info[0]
+            else:
+                row = index_info
+            indexdef = row.get("indexdef") or row.get("INDEXDEF")
+            if not indexdef:
+                return "-- 未找到 PostgreSQL 索引定义(indexdef), 无法生成重建SQL"
+            return str(indexdef)
+
+        return f"-- 当前不支持的数据库类型: {database_type}, 无法生成索引重建SQL"
     
     async def _assess_index_performance_impact(self, connector: BaseDatabaseConnector, index_spec: IndexSpec) -> Dict[str, Any]:
         """评估索引性能影响."""
-        return {
-            "index_size_estimate": "unknown",
-            "query_performance_improvement": "estimated_medium",
-            "maintenance_overhead": "low"
+        db_type = connector.database_type.lower()
+
+        impact: Dict[str, Any] = {
+            "index_size_estimate_bytes": None,
+            "row_count_estimate": None,
+            "query_performance_improvement": "unknown",
+            "maintenance_overhead": "unknown",
         }
+
+        try:
+            if db_type == "mysql":
+                # 使用 SHOW TABLE STATUS 获取大致行数和数据/索引大小
+                status_sql = f"SHOW TABLE STATUS LIKE '{index_spec.table_name}'"
+                rows = await connector.execute_query(status_sql)
+                if rows:
+                    r = rows[0]
+                    data_length = int(r.get("Data_length", 0) or 0)
+                    index_length = int(r.get("Index_length", 0) or 0)
+                    row_count = int(r.get("Rows", 0) or 0)
+                    impact["row_count_estimate"] = row_count
+
+                    # 粗略估计: 新索引大小 ~ 行数 * 每行每列约 64 字节
+                    per_row_per_col = 64
+                    est_size = row_count * per_row_per_col * max(len(index_spec.columns), 1)
+                    # 不让估计值小于当前 index_length 的 5%
+                    min_extra = int(index_length * 0.05) if index_length else 0
+                    if est_size < min_extra:
+                        est_size = min_extra or est_size
+                    impact["index_size_estimate_bytes"] = est_size
+
+                    # 粗略评估查询收益: 行数越多, 新索引带来的收益越高
+                    if row_count > 1_000_000:
+                        impact["query_performance_improvement"] = "high"
+                    elif row_count > 100_000:
+                        impact["query_performance_improvement"] = "medium"
+                    else:
+                        impact["query_performance_improvement"] = "low"
+
+                    # 维护成本: 列数越多、表越大, 成本越高
+                    if len(index_spec.columns) >= 3 or row_count > 1_000_000:
+                        impact["maintenance_overhead"] = "high"
+                    elif len(index_spec.columns) == 2 or row_count > 100_000:
+                        impact["maintenance_overhead"] = "medium"
+                    else:
+                        impact["maintenance_overhead"] = "low"
+
+            elif db_type == "postgresql":
+                # 使用 pg_catalog.pg_class 获取行数与表大小估计
+                sql = (
+                    "SELECT reltuples::bigint AS row_estimate, "
+                    "pg_relation_size(relid) AS table_bytes "
+                    "FROM pg_catalog.pg_statio_user_tables "
+                    f"WHERE relname = '{index_spec.table_name}' LIMIT 1"
+                )
+                rows = await connector.execute_query(sql)
+                if rows:
+                    r = rows[0]
+                    row_count = int(r.get("row_estimate", 0) or 0)
+                    table_bytes = int(r.get("table_bytes", 0) or 0)
+                    impact["row_count_estimate"] = row_count
+
+                    per_row_per_col = 64
+                    est_size = row_count * per_row_per_col * max(len(index_spec.columns), 1)
+                    if est_size > table_bytes:
+                        est_size = int(table_bytes * 0.75) if table_bytes else est_size
+                    impact["index_size_estimate_bytes"] = est_size
+
+                    if row_count > 1_000_000:
+                        impact["query_performance_improvement"] = "high"
+                    elif row_count > 100_000:
+                        impact["query_performance_improvement"] = "medium"
+                    else:
+                        impact["query_performance_improvement"] = "low"
+
+                    if len(index_spec.columns) >= 3 or row_count > 1_000_000:
+                        impact["maintenance_overhead"] = "high"
+                    elif len(index_spec.columns) == 2 or row_count > 100_000:
+                        impact["maintenance_overhead"] = "medium"
+                    else:
+                        impact["maintenance_overhead"] = "low"
+
+        except Exception as e:  # noqa: BLE001
+            logger.warning("评估索引性能影响时出错: %s", e)
+
+        return impact
     
     async def _assess_statistics_performance_impact(self, connector: BaseDatabaseConnector, tables: List[str]) -> Dict[str, Any]:
         """评估统计信息更新的性能影响."""
+        db_type = connector.database_type.lower()
+
+        table_rows: Dict[str, int] = {}
+        try:
+            for table in tables:
+                if db_type == "mysql":
+                    sql = f"SELECT TABLE_ROWS as row_count FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = '{table}'"
+                elif db_type == "postgresql":
+                    sql = (
+                        "SELECT reltuples::bigint AS row_count FROM pg_class "
+                        f"WHERE relname = '{table}' LIMIT 1"
+                    )
+                else:
+                    continue
+
+                try:
+                    rows = await connector.execute_query(sql)
+                    if rows:
+                        rc = rows[0].get("row_count") or rows[0].get("TABLE_ROWS")
+                        if rc is not None:
+                            table_rows[table] = int(rc)
+                except Exception:
+                    continue
+        except Exception as e:  # noqa: BLE001
+            logger.warning("统计信息性能影响评估中获取行数失败: %s", e)
+
+        total_rows = sum(table_rows.values()) if table_rows else None
+
         return {
             "tables_updated": len(tables),
-            "query_plan_improvements": "expected",
-            "update_duration": "varies_by_table_size"
+            "tables_row_estimates": table_rows,
+            "total_row_estimate": total_rows,
+            "query_plan_improvements": "expected",  # 语义化提示
+            "update_duration": "proportional_to_total_rows",
         }
 
     async def _get_mysql_table_columns(
@@ -1304,16 +1649,49 @@ class AutoOptimizer:
             
             # 基于执行计划分析生成建议
             for result in explain_results:
-                if hasattr(result, 'type') and result.type == "ALL":
-                    suggestions.append(QueryRewriteSuggestion(
-                        original_query=sql,
-                        rewritten_query=sql,  # 实际应该生成优化后的查询
-                        improvement_type="full_table_scan_optimization",
-                        expected_improvement="避免全表扫描",
-                        confidence=0.8,
-                        explanation="检测到全表扫描，建议添加索引或优化WHERE条件",
-                        rule_name="execution_plan_full_table_scan",
-                    ))
+                # 当前实现聚焦 MySQL 的全表扫描(type = ALL)场景, 尝试根据 possible_keys 生成 FORCE INDEX 提示性重写
+                if hasattr(result, "type") and str(getattr(result, "type", "")).upper() == "ALL":
+                    table = getattr(result, "table", None)
+                    possible_keys = getattr(result, "possible_keys", None)
+
+                    rewritten_sql = sql
+                    explanation = "检测到全表扫描, 建议为过滤条件列创建索引或优化WHERE条件。"
+
+                    if table and possible_keys:
+                        # possible_keys 形如 'idx_a,idx_b'
+                        first_key = str(possible_keys).split(",")[0].strip()
+                        if first_key:
+                            import re
+
+                            pattern = rf"FROM\s+{re.escape(str(table))}\b"
+                            replacement = f"FROM {table} FORCE INDEX ({first_key})"
+                            try:
+                                rewritten_sql, count = re.subn(
+                                    pattern,
+                                    replacement,
+                                    sql,
+                                    count=1,
+                                    flags=re.IGNORECASE,
+                                )
+                                if count > 0:
+                                    explanation = (
+                                        "检测到表 {table} 上的全表扫描(type=ALL), 且存在可用索引 {idx}, "
+                                        "已示例性将 FROM 子句改写为使用 FORCE INDEX 提示, 请在确认索引选择合理后再采用。"
+                                    ).format(table=table, idx=first_key)
+                            except re.error:  # noqa: BLE001
+                                rewritten_sql = sql
+
+                    suggestions.append(
+                        QueryRewriteSuggestion(
+                            original_query=sql,
+                            rewritten_query=rewritten_sql,
+                            improvement_type="full_table_scan_optimization",
+                            expected_improvement="避免或减轻全表扫描开销",
+                            confidence=0.8,
+                            explanation=explanation,
+                            rule_name="execution_plan_full_table_scan",
+                        )
+                    )
         
         except Exception as e:
             logger.warning(f"生成基于执行计划的建议失败: {e}")
@@ -1339,30 +1717,189 @@ class AutoOptimizer:
     
     async def _analyze_system_resources(self, connector: BaseDatabaseConnector) -> Dict[str, Any]:
         """分析系统资源."""
-        return {
-            "total_memory": "unknown",
-            "available_memory": "unknown",
-            "cpu_cores": "unknown",
-            "disk_space": "unknown"
+        resources: Dict[str, Any] = {
+            "total_memory_bytes": None,
+            "available_memory_bytes": None,
+            "cpu_cores": None,
+            "disk_total_bytes": None,
+            "disk_free_bytes": None,
         }
+
+        # 1. 尝试使用 psutil 获取主机资源信息
+        try:
+            if psutil is not None:
+                vm = psutil.virtual_memory()
+                resources["total_memory_bytes"] = int(vm.total)
+                resources["available_memory_bytes"] = int(vm.available)
+                resources["cpu_cores"] = int(psutil.cpu_count(logical=True) or 0)
+
+                try:
+                    du = psutil.disk_usage("/")
+                    resources["disk_total_bytes"] = int(du.total)
+                    resources["disk_free_bytes"] = int(du.free)
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception as e:  # noqa: BLE001
+            logger.warning("通过 psutil 获取系统资源失败: %s", e)
+
+        # 2. 可选: 结合数据库级别的资源配置进行补充
+        try:
+            if connector.database_type.lower() == "mysql":
+                # 示例: 记录 innodb_buffer_pool_size 作为内存利用的一个参考
+                rows = await connector.execute_query(
+                    "SHOW VARIABLES LIKE 'innodb_buffer_pool_size'"
+                )
+                if rows:
+                    resources["innodb_buffer_pool_size"] = int(rows[0].get("Value", 0) or 0)
+            elif connector.database_type.lower() == "postgresql":
+                rows = await connector.execute_query(
+                    "SELECT setting::bigint AS shared_buffers_bytes FROM pg_settings WHERE name = 'shared_buffers'"
+                )
+                if rows:
+                    resources["shared_buffers_bytes"] = int(
+                        rows[0].get("shared_buffers_bytes", 0) or 0
+                    )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("获取数据库资源配置失败: %s", e)
+
+        return resources
     
     def _generate_config_recommendations(self, current_config: Dict[str, Any], system_resources: Dict[str, Any], database_type: str) -> List[ConfigParameter]:
         """生成配置建议."""
         recommendations = []
-        
-        # 简化的配置建议逻辑
-        if database_type.lower() == "mysql":
-            if "innodb_buffer_pool_size" in current_config:
-                recommendations.append(ConfigParameter(
-                    parameter_name="innodb_buffer_pool_size",
-                    current_value=current_config["innodb_buffer_pool_size"],
-                    recommended_value="1G",  # 实际应该基于系统内存计算
-                    parameter_type="memory",
-                    description="InnoDB缓冲池大小",
-                    impact_level="high",
-                    requires_restart=True
-                ))
-        
+
+        def _parse_size(value: Any) -> Optional[int]:
+            """将类似 '128M' / '1G' / '4096MB' 或纯数字转换为字节数."""
+            if value is None:
+                return None
+            try:
+                # 已经是纯数字字符串或整数
+                if isinstance(value, (int, float)):
+                    return int(value)
+                s = str(value).strip().upper()
+                if s.isdigit():
+                    return int(s)
+                multipliers = {
+                    "K": 1024,
+                    "KB": 1024,
+                    "M": 1024**2,
+                    "MB": 1024**2,
+                    "G": 1024**3,
+                    "GB": 1024**3,
+                }
+                for suffix, mul in multipliers.items():
+                    if s.endswith(suffix):
+                        num = float(s[: -len(suffix)].strip())
+                        return int(num * mul)
+            except Exception:  # noqa: BLE001
+                return None
+            return None
+
+        def _format_size(num_bytes: int) -> str:
+            for unit in ["B", "KB", "MB", "GB", "TB"]:
+                if num_bytes < 1024 or unit == "TB":
+                    return f"{num_bytes:.0f}{unit}" if unit != "B" else str(num_bytes)
+                num_bytes /= 1024
+            return str(num_bytes)
+
+        total_mem = system_resources.get("total_memory_bytes")
+        if not isinstance(total_mem, int) or total_mem <= 0:
+            # 无法获取系统内存时, 不做激进调参, 避免误伤
+            logger.warning("系统总内存未知, 跳过自动配置推荐")
+            return recommendations
+
+        db_type = database_type.lower()
+
+        if db_type == "mysql":
+            # 基于预定义规则和系统内存生成建议
+            rules = self.config_tuning_rules.get("mysql", {})
+            for param_name, rule in rules.items():
+                if param_name not in current_config:
+                    continue
+
+                calc_expr = rule.get("calculation", "")  # 如 "memory * 0.7"
+                factor = 0.0
+                if "*" in calc_expr:
+                    try:
+                        factor = float(calc_expr.split("*")[-1].strip())
+                    except Exception:  # noqa: BLE001
+                        factor = 0.0
+
+                if factor <= 0:
+                    continue
+
+                target_bytes = int(total_mem * factor)
+
+                min_value = rule.get("min_value")
+                max_value = rule.get("max_value")
+                if min_value:
+                    min_bytes = _parse_size(min_value) or 0
+                    if target_bytes < min_bytes:
+                        target_bytes = min_bytes
+                if max_value:
+                    max_bytes = _parse_size(max_value) or 0
+                    if max_bytes and target_bytes > max_bytes:
+                        target_bytes = max_bytes
+
+                current_bytes = _parse_size(current_config.get(param_name))
+
+                # 建议与当前值相差不明显则不建议调整
+                if current_bytes and abs(target_bytes - current_bytes) < current_bytes * 0.1:
+                    continue
+
+                recommendations.append(
+                    ConfigParameter(
+                        parameter_name=param_name,
+                        current_value=current_config.get(param_name),
+                        recommended_value=_format_size(target_bytes),
+                        parameter_type="memory",
+                        description=rule.get("description", ""),
+                        impact_level="high" if factor >= 0.5 else "medium",
+                        requires_restart=True,
+                    )
+                )
+
+        elif db_type == "postgresql":
+            rules = self.config_tuning_rules.get("postgresql", {})
+            for param_name, rule in rules.items():
+                if param_name not in current_config:
+                    continue
+
+                calc_expr = rule.get("calculation", "")
+                factor = 0.0
+                if "*" in calc_expr:
+                    try:
+                        factor = float(calc_expr.split("*")[-1].strip())
+                    except Exception:  # noqa: BLE001
+                        factor = 0.0
+
+                if factor <= 0:
+                    continue
+
+                target_bytes = int(total_mem * factor)
+
+                min_value = rule.get("min_value")
+                if min_value:
+                    min_bytes = _parse_size(min_value) or 0
+                    if target_bytes < min_bytes:
+                        target_bytes = min_bytes
+
+                current_bytes = _parse_size(current_config.get(param_name))
+                if current_bytes and abs(target_bytes - current_bytes) < current_bytes * 0.1:
+                    continue
+
+                recommendations.append(
+                    ConfigParameter(
+                        parameter_name=param_name,
+                        current_value=current_config.get(param_name),
+                        recommended_value=_format_size(target_bytes),
+                        parameter_type="memory",
+                        description=rule.get("description", ""),
+                        impact_level="high" if factor >= 0.5 else "medium",
+                        requires_restart=True,
+                    )
+                )
+
         return recommendations
     
     def _generate_config_update_sql(self, recommendations: List[ConfigParameter], database_type: str) -> List[str]:
@@ -1413,6 +1950,53 @@ class AutoOptimizer:
         elif optimization_type == "statistics_update":
             tables = optimization_config.get("tables", [])
             return await self.update_statistics(connector, tables, user)
+        elif optimization_type == "config_tuning":
+            # 配置调优：直接调用 optimize_configuration
+            return await self.optimize_configuration(connector, user)
+        elif optimization_type == "index_deletion":
+            # 索引删除：需要提供 table_name 和 index_name
+            table_name = optimization_config.get("table_name")
+            index_name = optimization_config.get("index_name")
+            if not table_name or not index_name:
+                return OptimizationResult(
+                    optimization_type=OptimizationType.BATCH_OPTIMIZATION,
+                    status=OptimizationStatus.FAILED,
+                    database=connector.config.database,
+                    target_object=optimization_config.get("id", "unknown"),
+                    execution_time=0.0,
+                    error_message="index_deletion 需要 table_name 和 index_name",
+                )
+            return await self.drop_index(connector, index_name, table_name, user)
+        elif optimization_type == "query_rewrite":
+            # 查询重写：只返回评估结果，不执行变更
+            sql = optimization_config.get("sql")
+            if not sql:
+                return OptimizationResult(
+                    optimization_type=OptimizationType.BATCH_OPTIMIZATION,
+                    status=OptimizationStatus.FAILED,
+                    database=connector.config.database,
+                    target_object=optimization_config.get("id", "unknown"),
+                    execution_time=0.0,
+                    error_message="query_rewrite 需要 sql 字段",
+                )
+
+            start_time = datetime.now()
+            result_dict = await self.optimize_query(sql, connector, user, auto_apply=False)
+            completed_at = datetime.now()
+
+            return OptimizationResult(
+                optimization_type=OptimizationType.QUERY_REWRITE,
+                status=OptimizationStatus.COMPLETED,
+                database=connector.config.database,
+                target_object=optimization_config.get("id", "unknown"),
+                executed_sql=[],
+                execution_time=(completed_at - start_time).total_seconds(),
+                performance_impact={
+                    "original_cost": result_dict.get("original_cost"),
+                    "best_cost": result_dict.get("best_cost"),
+                    "improvement": result_dict.get("improvement"),
+                },
+            )
         else:
             # 创建失败结果
             return OptimizationResult(

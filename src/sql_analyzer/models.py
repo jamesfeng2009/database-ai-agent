@@ -1,6 +1,8 @@
 """SQL 分析相关的数据模型."""
 
+
 from datetime import datetime
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -82,7 +84,6 @@ class SQLAnalysisResponse(BaseModel):
     )
 
 
-
 class MySQLConfig(BaseModel):
     """MySQL 数据库连接配置."""
     
@@ -142,4 +143,30 @@ class BatchAnalysisResult(BaseModel):
     results: List[SlowQueryAnalysisResult] = Field(..., description="分析结果列表")
     summary_stats: Dict[str, Any] = Field(default_factory=dict, description="统计摘要")
     start_time: datetime = Field(..., description="分析开始时间")
-    end_time: datetime = Field(..., description="分析结束时间") 
+    end_time: datetime = Field(..., description="分析结束时间")
+
+
+class SlowQueryOptimizationTaskStatus(str, Enum):
+    """慢查询优化任务状态."""
+
+    PENDING_REVIEW = "PENDING_REVIEW"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"
+    EXECUTED = "EXECUTED"
+
+
+class SlowQueryOptimizationTask(BaseModel):
+    """慢查询优化任务，用于人工审核和执行闭环."""
+
+    task_id: str = Field(..., description="任务 ID")
+    slow_query: SlowQueryEntry = Field(..., description="关联的慢查询")
+    optimize_result: Dict[str, Any] = Field(..., description="AutoOptimizer.optimize_query 的完整结果")
+    status: SlowQueryOptimizationTaskStatus = Field(
+        default=SlowQueryOptimizationTaskStatus.PENDING_REVIEW,
+        description="任务状态",
+    )
+    created_at: datetime = Field(default_factory=datetime.utcnow, description="任务创建时间")
+    updated_at: datetime = Field(default_factory=datetime.utcnow, description="任务最近更新时间")
+    reviewer: Optional[str] = Field(None, description="审核人标识")
+    review_comment: Optional[str] = Field(None, description="审核意见")
+    executed_at: Optional[datetime] = Field(None, description="任务执行时间")

@@ -133,10 +133,158 @@ class EventPersistence:
         return events
 
 
+class EventStateBackend:
+    """事件状态持久化后端基类.
+
+    当前实现用于持久化路由与订阅的元数据, 以便在多实例或工具中
+    对事件系统的配置进行审计与管理。默认实现使用 SQLite 存储。
+    """
+
+    async def save_route(self, route: EventRoute) -> None:  # pragma: no cover - 接口定义
+        raise NotImplementedError
+
+    async def delete_route(self, route_id: str) -> None:  # pragma: no cover - 接口定义
+        raise NotImplementedError
+
+    async def save_subscription(self, subscription: EventSubscription) -> None:  # pragma: no cover - 接口定义
+        raise NotImplementedError
+
+    async def delete_subscription(self, subscription_id: str) -> None:  # pragma: no cover - 接口定义
+        raise NotImplementedError
+
+
+class SqliteEventStateBackend(EventStateBackend):
+    """基于 SQLite 的事件状态持久化后端.
+
+    使用与 EventPersistence 相同的 db_path, 但独立的表结构, 用于
+    存储路由和订阅的配置 JSON, 不涉及 handler 可调用对象本身。
+    """
+
+    def __init__(self, db_path: str = "events.db") -> None:
+        self.db_path = Path(db_path)
+        self._init_database()
+
+    def _init_database(self) -> None:
+        """初始化路由与订阅状态表."""
+
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_routes (
+                  route_id    TEXT PRIMARY KEY,
+                  name        TEXT,
+                  enabled     INTEGER NOT NULL,
+                  config_json TEXT NOT NULL,
+                  updated_at  TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS event_subscriptions (
+                  subscription_id TEXT PRIMARY KEY,
+                  event_type      TEXT NOT NULL,
+                  handler_id      TEXT NOT NULL,
+                  active          INTEGER NOT NULL,
+                  filter_json     TEXT,
+                  updated_at      TEXT NOT NULL
+                )
+                """
+            )
+
+    async def save_route(self, route: EventRoute) -> None:
+        """持久化事件路由配置."""
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """
+                    INSERT INTO event_routes (route_id, name, enabled, config_json, updated_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(route_id) DO UPDATE SET
+                      name        = excluded.name,
+                      enabled     = excluded.enabled,
+                      config_json = excluded.config_json,
+                      updated_at  = excluded.updated_at
+                    """,
+                    (
+                        route.route_id,
+                        getattr(route, "name", ""),
+                        1 if route.enabled else 0,
+                        json.dumps(route.dict(), ensure_ascii=False),
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("持久化事件路由失败: %s", exc)
+
+    async def delete_route(self, route_id: str) -> None:
+        """删除持久化的事件路由配置."""
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM event_routes WHERE route_id = ?", (route_id,))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除事件路由持久化记录失败: %s", exc)
+
+    async def save_subscription(self, subscription: EventSubscription) -> None:
+        """持久化订阅配置元数据."""
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                filter_json = None
+                try:
+                    if subscription.filter is not None:
+                        filter_json = json.dumps(subscription.filter.dict(), ensure_ascii=False)
+                except Exception:
+                    filter_json = None
+
+                conn.execute(
+                    """
+                    INSERT INTO event_subscriptions (
+                      subscription_id, event_type, handler_id, active, filter_json, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(subscription_id) DO UPDATE SET
+                      event_type  = excluded.event_type,
+                      handler_id  = excluded.handler_id,
+                      active      = excluded.active,
+                      filter_json = excluded.filter_json,
+                      updated_at  = excluded.updated_at
+                    """,
+                    (
+                        subscription.subscription_id,
+                        subscription.event_type.value,
+                        subscription.handler_id,
+                        1 if getattr(subscription, "active", True) else 0,
+                        filter_json,
+                        datetime.utcnow().isoformat(),
+                    ),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("持久化事件订阅失败: %s", exc)
+
+    async def delete_subscription(self, subscription_id: str) -> None:
+        """删除持久化的订阅记录."""
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    "DELETE FROM event_subscriptions WHERE subscription_id = ?",
+                    (subscription_id,),
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("删除事件订阅持久化记录失败: %s", exc)
+
+
 class EventBus:
     """增强的事件总线，支持过滤、路由、优先级队列和批量处理."""
     
-    def __init__(self, enable_persistence: bool = True, db_path: str = "events.db"):
+    def __init__(
+        self,
+        enable_persistence: bool = True,
+        db_path: str = "events.db",
+        state_backend: Optional[EventStateBackend] = None,
+    ):
         """初始化事件总线."""
         self._subscribers: Dict[EventType, WeakSet] = {}
         self._subscriptions: Dict[str, EventSubscription] = {}
@@ -152,6 +300,8 @@ class EventBus:
         # 过滤器和路由
         self._filters: Dict[str, EventFilter] = {}
         self._routes: Dict[str, EventRoute] = {}
+        # handler 注册表: handler_id -> {callables}
+        self._handler_registry: Dict[str, WeakSet] = {}
         
         # 批量处理
         self._batch_size = 10
@@ -164,6 +314,14 @@ class EventBus:
         self._persistence: Optional[EventPersistence] = None
         if enable_persistence:
             self._persistence = EventPersistence(db_path)
+
+        # 状态持久化 (路由与订阅)
+        self._state_backend: Optional[EventStateBackend] = None
+        if state_backend is not None:
+            self._state_backend = state_backend
+        elif enable_persistence:
+            # 默认使用与事件持久化相同的 SQLite 文件
+            self._state_backend = SqliteEventStateBackend(db_path)
         
         # 处理任务
         self._processing_task: Optional[asyncio.Task] = None
@@ -270,16 +428,71 @@ class EventBus:
     
     async def _apply_routes(self, event: Event) -> List[Callable]:
         """应用事件路由."""
-        handlers = []
+        handlers: List[Callable] = []
+
         for route in self._routes.values():
             if not route.enabled:
                 continue
-            
-            if await self._apply_filters(event):  # 使用路由的过滤器
-                # 这里应该根据target_handlers获取实际的处理器
-                # 简化实现，直接返回空列表
-                pass
-        
+
+            # 基于路由自身的过滤条件进行匹配: 事件类型 / 源模式 / 数据过滤等
+            # 为了避免强依赖 EventRoute 的内部实现, 这里采用"存在则检查"的方式。
+
+            # 事件类型过滤
+            route_event_types = getattr(route, "event_types", None)
+            if route_event_types and event.event_type not in route_event_types:
+                continue
+
+            # 源模式过滤
+            route_source_patterns = getattr(route, "source_patterns", None)
+            if route_source_patterns:
+                import re
+
+                if not any(
+                    re.match(pattern, event.source) for pattern in route_source_patterns
+                ):
+                    continue
+
+            # 优先级过滤
+            route_priority_threshold = getattr(route, "priority_threshold", None)
+            if route_priority_threshold is not None:
+                priority_order = {
+                    EventPriority.LOW: 0,
+                    EventPriority.MEDIUM: 1,
+                    EventPriority.HIGH: 2,
+                    EventPriority.CRITICAL: 3,
+                }
+                if (
+                    priority_order.get(event.priority, 0)
+                    < priority_order.get(route_priority_threshold, 0)
+                ):
+                    continue
+
+            # 数据过滤 (如果 route 携带 data_filters, 与 EventFilter 保持一致语义)
+            route_data_filters = getattr(route, "data_filters", None)
+            if route_data_filters:
+                if not self._match_data_filters(event.data, route_data_filters):
+                    continue
+
+            # 根据 target_handlers 获取实际处理器
+            target_ids = getattr(route, "target_handlers", None) or []
+            if not target_ids:
+                continue
+
+            for handler_id in target_ids:
+                # 通过订阅记录和注册表解析 handler
+                for sub in self._subscriptions.values():
+                    if (
+                        sub.handler_id == handler_id
+                        and sub.event_type == event.event_type
+                        and getattr(sub, "active", True)
+                    ):
+                        registry_set = self._handler_registry.get(handler_id)
+                        if not registry_set:
+                            continue
+                        for h in list(registry_set):
+                            if h in self._subscribers.get(event.event_type, WeakSet()):
+                                handlers.append(h)
+
         return handlers
     
     async def subscribe(
@@ -311,8 +524,22 @@ class EventBus:
                 filter=filter_obj
             )
             self._subscriptions[subscription.subscription_id] = subscription
+
+            # 记录 handler 注册信息, 便于路由和取消订阅时解析
+            handler_id = subscription.handler_id
+            if handler_id not in self._handler_registry:
+                self._handler_registry[handler_id] = WeakSet()
+            self._handler_registry[handler_id].add(handler)
             
             logger.debug(f"订阅事件类型: {event_type}, 处理器: {handler.__name__ if hasattr(handler, '__name__') else str(handler)}")
+
+            # 可选: 持久化订阅元数据
+            if self._state_backend is not None:
+                try:
+                    await self._state_backend.save_subscription(subscription)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("持久化订阅配置失败: %s", exc)
+
             return subscription.subscription_id
     
     async def unsubscribe(self, subscription_id: str) -> None:
@@ -325,10 +552,26 @@ class EventBus:
             if subscription_id in self._subscriptions:
                 subscription = self._subscriptions[subscription_id]
                 if subscription.event_type in self._subscribers:
-                    # 这里需要根据handler_id找到实际的处理器，简化实现
-                    pass
+                    # 根据 handler_id 找到实际的处理器并从订阅者集合中移除
+                    handler_id = subscription.handler_id
+                    registry_set = self._handler_registry.get(handler_id)
+                    if registry_set:
+                        for handler in list(registry_set):
+                            self._subscribers[subscription.event_type].discard(handler)
+                        # 清理空的注册记录
+                        if not list(registry_set):
+                            del self._handler_registry[handler_id]
+                # 将订阅标记为非活动并删除记录
+                setattr(subscription, "active", False)
                 del self._subscriptions[subscription_id]
                 logger.debug(f"取消订阅: {subscription_id}")
+
+                # 可选: 删除持久化订阅记录
+                if self._state_backend is not None:
+                    try:
+                        await self._state_backend.delete_subscription(subscription_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("删除订阅持久化记录失败: %s", exc)
     
     async def unsubscribe_handler(self, event_type: EventType, handler: Callable[[Event], None]) -> None:
         """取消订阅事件类型（兼容旧接口）.
@@ -475,27 +718,33 @@ class EventBus:
         async with self._lock:
             self._filters[filter_obj.filter_id] = filter_obj
             logger.debug(f"更新事件过滤器: {filter_obj.name}")
-    
-    # 路由管理
+
     async def add_route(self, route: EventRoute) -> None:
         """添加事件路由."""
         async with self._lock:
             self._routes[route.route_id] = route
             logger.debug(f"添加事件路由: {route.name}")
-    
+
+            # 可选: 持久化路由配置
+            if self._state_backend is not None:
+                try:
+                    await self._state_backend.save_route(route)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("持久化事件路由配置失败: %s", exc)
+
     async def remove_route(self, route_id: str) -> None:
         """移除事件路由."""
         async with self._lock:
             if route_id in self._routes:
                 del self._routes[route_id]
                 logger.debug(f"移除事件路由: {route_id}")
-    
-    # 批量处理管理
-    async def add_batch_handler(self, handler: Callable[[EventBatch], None]) -> None:
-        """添加批量事件处理器."""
-        async with self._lock:
-            self._batch_handlers.append(handler)
-            logger.debug(f"添加批量事件处理器: {handler}")
+
+                # 可选: 删除持久化路由记录
+                if self._state_backend is not None:
+                    try:
+                        await self._state_backend.delete_route(route_id)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("删除事件路由持久化记录失败: %s", exc)
     
     async def remove_batch_handler(self, handler: Callable[[EventBatch], None]) -> None:
         """移除批量事件处理器."""
@@ -1664,6 +1913,8 @@ class EventStreamProcessor:
         self._transformations: Dict[str, StreamTransformation] = {}
         self._aggregators: Dict[str, StreamAggregator] = {}
         self._backpressure_config = BackpressureConfig()
+        # 每个流可单独覆盖背压配置
+        self._stream_backpressure: Dict[str, BackpressureConfig] = {}
         self._lock = asyncio.Lock()
         
         # 处理任务
@@ -1677,6 +1928,9 @@ class EventStreamProcessor:
         # 性能监控
         self._start_time = datetime.now()
         self._last_metrics_update = datetime.now()
+        # 归约/聚合状态
+        self._reduce_states: Dict[str, Dict[str, Any]] = {}
+        self._aggregator_states: Dict[str, Dict[str, Any]] = {}
     
     async def create_stream(
         self, 
@@ -1695,7 +1949,7 @@ class EventStreamProcessor:
             
             if backpressure_config:
                 # 为特定流设置背压配置
-                pass
+                self._stream_backpressure[stream_id] = backpressure_config
             
             # 启动流处理任务
             task = asyncio.create_task(self._process_stream(stream))
@@ -1860,10 +2114,52 @@ class EventStreamProcessor:
         reduce_field = transformation.parameters.get("reduce_field")
         reduce_function = transformation.parameters.get("function", "sum")
         
-        if reduce_field and reduce_field in event.data:
-            # 这里应该维护状态进行归约，简化实现
-            pass
-        
+        if not reduce_field or reduce_field not in event.data:
+            return event
+
+        # 这里维护每个 transformation 的归约状态, 包含 sum / count / last_value
+        state = self._reduce_states.setdefault(
+            transformation.transformation_id,
+            {"sum": 0.0, "count": 0, "last": None},
+        )
+
+        try:
+            value = float(event.data.get(reduce_field, 0) or 0)
+        except Exception:
+            return event
+
+        state["sum"] = float(state.get("sum", 0.0)) + value
+        state["count"] = int(state.get("count", 0)) + 1
+        state["last"] = value
+
+        # 根据归约函数生成一个附加字段, 不改变原始字段
+        reduced_key = transformation.parameters.get(
+            "output_field", f"reduced_{reduce_field}"
+        )
+
+        if reduce_function == "sum":
+            reduced_value = state["sum"]
+        elif reduce_function == "avg":
+            cnt = state.get("count", 0) or 0
+            reduced_value = state["sum"] / cnt if cnt > 0 else 0.0
+        elif reduce_function == "max":
+            prev_max = state.get("max")
+            if prev_max is None or value > prev_max:
+                state["max"] = value
+            reduced_value = state.get("max", value)
+        elif reduce_function == "min":
+            prev_min = state.get("min")
+            if prev_min is None or value < prev_min:
+                state["min"] = value
+            reduced_value = state.get("min", value)
+        elif reduce_function == "count":
+            reduced_value = state["count"]
+        else:
+            # 未知函数, 保持事件不变
+            return event
+
+        # 在 data 中附加归约结果, 形成一种"流上的累积视图"
+        event.data[reduced_key] = reduced_value
         return event
     
     async def _update_stream_windows(self, stream_id: str, event: Event) -> None:
@@ -1962,26 +2258,70 @@ class EventStreamProcessor:
     
     async def _execute_aggregation(self, aggregator: StreamAggregator, event: Event) -> None:
         """执行单个聚合."""
-        # 简化的聚合实现
-        if aggregator.aggregation_function == "count":
-            # 计数聚合
-            pass
-        elif aggregator.aggregation_function == "sum":
-            # 求和聚合
-            pass
-        elif aggregator.aggregation_function == "avg":
-            # 平均值聚合
-            pass
-        # 其他聚合函数...
+        # 简化的聚合实现: 在处理流事件时维护每个聚合器的状态
+        agg_id = aggregator.aggregator_id
+        func = aggregator.aggregation_function
+        field = aggregator.parameters.get("field") if aggregator.parameters else None
+
+        state = self._aggregator_states.setdefault(
+            agg_id,
+            {"count": 0, "sum": 0.0},
+        )
+
+        try:
+            increment = 1
+            value = None
+            if field:
+                raw = event.data.get(field)
+                if raw is not None:
+                    try:
+                        value = float(raw)
+                    except Exception:
+                        value = None
+
+            if func == "count":
+                state["count"] = int(state.get("count", 0)) + increment
+                aggregator.result = {
+                    "function": "count",
+                    "value": state["count"],
+                    "last_event_time": event.timestamp.isoformat(),
+                }
+            elif func in {"sum", "avg"} and value is not None:
+                state["count"] = int(state.get("count", 0)) + 1
+                state["sum"] = float(state.get("sum", 0.0)) + value
+                if func == "sum":
+                    aggregator.result = {
+                        "function": "sum",
+                        "field": field,
+                        "value": state["sum"],
+                        "samples": state["count"],
+                    }
+                else:  # avg
+                    cnt = state["count"] or 1
+                    avg = state["sum"] / cnt
+                    aggregator.result = {
+                        "function": "avg",
+                        "field": field,
+                        "value": avg,
+                        "samples": state["count"],
+                    }
+            # 其他聚合函数可以在此扩展
+        except Exception as e:  # noqa: BLE001
+            logger.error("执行流聚合时出错: %s", e)
     
     async def _handle_backpressure(self, stream_id: str) -> None:
         """处理背压."""
         current_buffer_size = self._buffer_sizes.get(stream_id, 0)
-        max_buffer_size = self._backpressure_config.max_buffer_size
+        # 支持每个流自定义背压配置, 否则回退到全局配置
+        config = self._stream_backpressure.get(stream_id, self._backpressure_config)
+        max_buffer_size = config.max_buffer_size
         
-        if current_buffer_size > max_buffer_size * self._backpressure_config.high_watermark:
+        if max_buffer_size <= 0:
+            return
+
+        if current_buffer_size > max_buffer_size * config.high_watermark:
             # 触发背压
-            strategy = self._backpressure_config.backpressure_strategy
+            strategy = config.backpressure_strategy
             
             if strategy == "drop_oldest":
                 # 丢弃最旧的事件
@@ -1994,15 +2334,40 @@ class EventStreamProcessor:
                         except asyncio.QueueEmpty:
                             pass
             elif strategy == "drop_newest":
-                # 丢弃最新的事件（不添加到队列）
-                pass
+                # 丢弃最新的事件（队列尾部）
+                if stream_id in self._streams:
+                    stream = self._streams[stream_id]
+                    try:
+                        # 由于 asyncio.Queue 不支持直接从尾部弹出,
+                        # 这里通过轮转的方式保留前 n-1 个元素, 丢弃最后一个。
+                        size = stream.events.qsize()
+                        if size > 0:
+                            keep = size - 1
+                            tmp: List[Any] = []
+                            for _ in range(keep):
+                                try:
+                                    tmp.append(stream.events.get_nowait())
+                                except asyncio.QueueEmpty:
+                                    break
+                            # 丢弃队尾元素
+                            try:
+                                stream.events.get_nowait()
+                                stream.metrics.events_dropped += 1
+                            except asyncio.QueueEmpty:
+                                pass
+                            # 将保留的元素按原顺序放回队列
+                            for item in tmp:
+                                await stream.events.put(item)
+                    except Exception:
+                        # 出错时不影响主流程
+                        pass
             elif strategy == "block":
                 # 阻塞处理
                 await asyncio.sleep(0.1)
             
             # 应用限流
-            if self._backpressure_config.throttle_rate:
-                throttle_delay = 1.0 / self._backpressure_config.throttle_rate
+            if config.throttle_rate:
+                throttle_delay = 1.0 / config.throttle_rate
                 await asyncio.sleep(throttle_delay)
     
     async def _update_stream_metrics(self, stream_id: str) -> None:
